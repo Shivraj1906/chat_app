@@ -6,12 +6,7 @@
 namespace {
 
 bool is_known_message_type(std::uint8_t value) {
-  switch (static_cast<MessageType>(value)) {
-  case MessageType::CLIENT_HELLO:
-  case MessageType::SERVER_RESPONSE:
-    return true;
-  }
-  return false;
+  return value < static_cast<std::uint8_t>(MessageType::COUNT);
 }
 
 } // namespace

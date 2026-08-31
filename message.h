@@ -9,6 +9,15 @@
 enum class MessageType : std::uint8_t {
   CLIENT_HELLO = 0,
   SERVER_RESPONSE = 1,
+  CHAT_MESSAGE = 2,
+  LOGIN_ACCEPTED = 3,
+  LOGIN_REJECTED = 4,
+  DIRECT_MESSAGE = 5,
+  WHO_REQUEST = 6,
+  WHO_RESPONSE = 7,
+  SERVER_ERROR = 8,
+  // Add new message types above COUNT. Header validation updates automatically.
+  COUNT
 };
 
 // Wire format: one byte for the type, four bytes for the payload size in
