@@ -10,12 +10,27 @@
 #include <sys/types.h>  // common types
 #include <unistd.h>     // unix api
 
+#include "message.h"
+#include "socket_io.h"
+
 using namespace std;
 
 int main() {
   uint16_t portnumber = 5000;
   string server_ip = "127.0.0.1";
   int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd == -1) {
+    cerr << "error in creating socket" << endl;
+    return -1;
+  }
+
+  int reuse_address = 1;
+  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse_address,
+                 sizeof(reuse_address)) == -1) {
+    cerr << "error configuring socket" << endl;
+    close(fd);
+    return -1;
+  }
 
   sockaddr_in server_address{};
   server_address.sin_family = AF_INET;
@@ -37,18 +52,38 @@ int main() {
 
   std::cout << "Waiting for client ...\n";
   int client_fd = accept(fd, nullptr, nullptr);
+  if (client_fd == -1) {
+    cerr << "error accepting client" << endl;
+    close(fd);
+    return -1;
+  }
 
   std::cout << "client connected\n";
 
-  char buffer[256];
-  recv(client_fd, buffer, 256, 0);
+  Message request(MessageType::CLIENT_HELLO, "");
+  if (!receive_message(client_fd, request)) {
+    cerr << "error receiving message" << endl;
+    close(client_fd);
+    close(fd);
+    return -1;
+  }
+  if (request.type() != MessageType::CLIENT_HELLO) {
+    cerr << "client sent an unexpected message type" << endl;
+    close(client_fd);
+    close(fd);
+    return -1;
+  }
+  cout << "client said: " << request.payload_as_string() << endl;
 
-  cout << "client said: " << buffer << endl;
-
-  string message = "This is the response from server...";
-  int bytes_sent = send(client_fd, message.data(), message.size() + 1, 0);
-
-  cout << bytes_sent << " bytes sent to the client" << endl;
+  const Message response(MessageType::SERVER_RESPONSE,
+                         "This is the response from server...");
+  if (!send_message(client_fd, response)) {
+    cerr << "error sending response" << endl;
+    close(client_fd);
+    close(fd);
+    return -1;
+  }
+  cout << response.payload_size() << " bytes sent to the client" << endl;
 
   close(client_fd);
   close(fd);

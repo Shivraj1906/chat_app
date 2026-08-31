@@ -9,6 +9,8 @@
 #include <sys/types.h>  // common types
 #include <unistd.h>     // unix api
 
+#include "message.h"
+#include "socket_io.h"
 using namespace std;
 
 int main() {
@@ -31,22 +33,37 @@ int main() {
 
   if (connect(fd, reinterpret_cast<sockaddr *>(&server_addr),
               sizeof(server_addr)) == -1) {
-    cout << "error in connecting to the server" << endl;
+    cerr << "error in connecting to the server" << endl;
+    close(fd);
+    return -1;
   }
 
   cout << "Connection established" << endl;
-  string message;
-  getline(cin, message);
+  string str;
+  getline(cin, str);
 
-  long bytes_sent = send(fd, message.data(), message.size() + 1, 0);
-  cout << bytes_sent << "bytes sent to the server" << endl;
+  // build and send the message
+  const Message message(MessageType::CLIENT_HELLO, str);
+  if (!send_message(fd, message)) {
+    cerr << "error sending message" << endl;
+    close(fd);
+    return -1;
+  }
 
-  // receive a response form the server
-  char buffer[256];
-
-  long bytes_received = recv(fd, buffer, 256, 0);
-  cout << bytes_received
-       << " bytes received from the server. Message: " << buffer << endl;
+  Message response(MessageType::SERVER_RESPONSE, "");
+  if (!receive_message(fd, response)) {
+    cerr << "error receiving response" << endl;
+    close(fd);
+    return -1;
+  }
+  if (response.type() != MessageType::SERVER_RESPONSE) {
+    cerr << "server sent an unexpected message type" << endl;
+    close(fd);
+    return -1;
+  }
+  cout << response.payload_size()
+       << " bytes received from the server. Message: "
+       << response.payload_as_string() << endl;
 
   close(fd);
   return 0;
