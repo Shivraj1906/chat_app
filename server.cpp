@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -11,6 +12,7 @@
 
 #include "chat_protocol.h"
 #include "client_registry.h"
+#include "key_exchange.h"
 #include "socket_io.h"
 
 namespace {
@@ -53,6 +55,34 @@ void *handle_client(void *argument) {
       static_cast<ClientContext *>(argument));
   const int client_fd = context->fd;
   ClientRegistry &registry = *context->registry;
+
+  Message client_key_message(MessageType::DH_PUBLIC_KEY, "");
+  if (!receive_message(client_fd, client_key_message) ||
+      client_key_message.type() != MessageType::DH_PUBLIC_KEY) {
+    log_line("WARN", "connection closed before Diffie-Hellman exchange");
+    close(client_fd);
+    return nullptr;
+  }
+
+  try {
+    const Number client_public_key =
+        dh_decode_public_key(client_key_message.payload_as_string());
+    const DhKeyPair dh_keys = dh_generate_key_pair();
+    if (!send_message(client_fd,
+                      Message(MessageType::DH_PUBLIC_KEY,
+                              dh_encode_public_key(dh_keys.public_key)))) {
+      close(client_fd);
+      return nullptr;
+    }
+    const Number shared_secret =
+        dh_shared_secret(client_public_key, dh_keys.private_key);
+    log_line("DH", "shared secret: " + shared_secret.to_hex());
+  } catch (const std::exception &error) {
+    log_line("WARN", std::string("Diffie-Hellman exchange failed: ") +
+                         error.what());
+    close(client_fd);
+    return nullptr;
+  }
 
   Message hello(MessageType::CLIENT_HELLO, "");
   if (!receive_message(client_fd, hello) ||
@@ -102,8 +132,19 @@ void *handle_client(void *argument) {
 
 } // namespace
 
-int main() {
-  const std::uint16_t port = 5000;
+int main(int argc, char *argv[]) {
+  if (argc > 2) {
+    std::cerr << "Usage: " << argv[0] << " [port]" << std::endl;
+    return -1;
+  }
+
+  const long requested_port = argc == 2 ? std::strtol(argv[1], nullptr, 10)
+                                        : 5000;
+  if (requested_port < 1 || requested_port > 65535) {
+    std::cerr << "invalid port" << std::endl;
+    return -1;
+  }
+  const std::uint16_t port = static_cast<std::uint16_t>(requested_port);
   const std::string server_ip = "127.0.0.1";
   const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (server_fd == -1) {

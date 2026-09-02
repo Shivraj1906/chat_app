@@ -2,9 +2,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -26,6 +29,11 @@ public:
     if (s.empty()) {
       n = {0};
       return;
+    }
+    if (s.size() > 512 || !std::all_of(s.begin(), s.end(), [](char character) {
+          return std::isxdigit(static_cast<unsigned char>(character)) != 0;
+        })) {
+      throw std::invalid_argument("Invalid hexadecimal number");
     }
 
     for (int end = static_cast<int>(s.size()); end > 0; end -= 16) {
@@ -60,6 +68,14 @@ public:
       return false;
 
     return ((n[limb] >> offset) & 1ULL) != 0;
+  }
+
+  std::string to_hex() const {
+    std::ostringstream output;
+    output << std::hex << n.back();
+    for (std::size_t i = n.size() - 1; i-- > 0;)
+      output << std::setw(16) << std::setfill('0') << n[i];
+    return output.str();
   }
 
   friend bool operator==(const Number &a, const Number &b) {
@@ -222,12 +238,99 @@ public:
     return remainder;
   }
 
-  void print_num() const {
-    std::cout << std::hex;
-    std::cout << n.back();
-    for (std::size_t i = n.size() - 1; i-- > 0;)
-      std::cout << std::setw(16) << std::setfill('0') << n[i];
-
-    std::cout << std::setfill(' ') << std::dec << '\n';
-  }
+  void print_num() const { std::cout << to_hex() << '\n'; }
 };
+
+inline Number mod_exp(Number base, const Number &exponent,
+                      const Number &modulus) {
+  if (modulus.is_zero())
+    throw std::runtime_error("Modular exponentiation with zero modulus");
+
+  Number result = Number(1) % modulus;
+  base = base % modulus;
+  for (std::size_t i = 0; i < exponent.bit_length(); ++i) {
+    if (exponent.get_bit(i))
+      result = (result * base) % modulus;
+    base = (base * base) % modulus;
+  }
+  return result;
+}
+
+// RFC 3526, section 3: 2048-bit MODP group (group identifier 14).
+static const unsigned RFC3526_MODP_GROUP14_ID = 14;
+static const unsigned RFC3526_MODP_GROUP14_BITS = 2048;
+
+inline const Number &rfc3526_modp_group14_prime() {
+  static const Number modulus("FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
+                              "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+                              "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
+                              "E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+                              "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3D"
+                              "C2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
+                              "83655D23DCA3AD961C62F356208552BB9ED529077096966D"
+                              "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
+                              "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9"
+                              "DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
+                              "15728E5A8AACAA68FFFFFFFFFFFFFFFF");
+  return modulus;
+}
+
+inline const Number &rfc3526_modp_group14_generator() {
+  static const Number generator(2);
+  return generator;
+}
+
+struct DhKeyPair {
+  Number private_key;
+  Number public_key;
+};
+
+inline Number dh_random_private_key() {
+  std::random_device source;
+  std::ostringstream hex;
+  hex << std::hex << std::setfill('0');
+  for (int i = 0; i < 2; ++i) {
+    std::uint32_t word = source();
+    if (i == 0)
+      word |= 0x80000000U;
+    hex << std::setw(8) << word;
+  }
+  return Number(hex.str());
+}
+
+inline DhKeyPair dh_generate_key_pair() {
+  DhKeyPair pair;
+  pair.private_key = dh_random_private_key();
+  pair.public_key = mod_exp(rfc3526_modp_group14_generator(), pair.private_key,
+                            rfc3526_modp_group14_prime());
+  return pair;
+}
+
+inline bool dh_valid_public_key(const Number &public_key) {
+  return public_key >= Number(2) &&
+         public_key <= rfc3526_modp_group14_prime() - Number(2);
+}
+
+inline Number dh_shared_secret(const Number &peer_public_key,
+                               const Number &private_key) {
+  if (!dh_valid_public_key(peer_public_key))
+    throw std::invalid_argument("Invalid Diffie-Hellman public key");
+  return mod_exp(peer_public_key, private_key, rfc3526_modp_group14_prime());
+}
+
+inline std::string dh_encode_public_key(const Number &public_key) {
+  return std::to_string(RFC3526_MODP_GROUP14_ID) + "\n" + public_key.to_hex();
+}
+
+inline Number dh_decode_public_key(const std::string &payload) {
+  const std::size_t separator = payload.find('\n');
+  if (separator == std::string::npos ||
+      payload.substr(0, separator) != std::to_string(RFC3526_MODP_GROUP14_ID)) {
+    throw std::invalid_argument("Unsupported Diffie-Hellman group");
+  }
+
+  const Number public_key(payload.substr(separator + 1));
+  if (!dh_valid_public_key(public_key))
+    throw std::invalid_argument("Invalid Diffie-Hellman public key");
+  return public_key;
+}

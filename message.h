@@ -16,6 +16,7 @@ enum class MessageType : std::uint8_t {
   WHO_REQUEST = 6,
   WHO_RESPONSE = 7,
   SERVER_ERROR = 8,
+  DH_PUBLIC_KEY = 9,
   // Add new message types above COUNT. Header validation updates automatically.
   COUNT
 };

@@ -10,6 +10,7 @@
 
 #include "chat_protocol.h"
 #include "client_command.h"
+#include "key_exchange.h"
 #include "socket_io.h"
 
 using namespace std;
@@ -88,6 +89,35 @@ int main(int argc, char *argv[]) {
     close(fd);
     return -1;
   }
+
+  const DhKeyPair dh_keys = dh_generate_key_pair();
+  if (!send_message(fd,
+                    Message(MessageType::DH_PUBLIC_KEY,
+                            dh_encode_public_key(dh_keys.public_key)))) {
+    cerr << "error sending Diffie-Hellman public key" << endl;
+    close(fd);
+    return -1;
+  }
+
+  Message server_key_message(MessageType::DH_PUBLIC_KEY, "");
+  if (!receive_message(fd, server_key_message) ||
+      server_key_message.type() != MessageType::DH_PUBLIC_KEY) {
+    cerr << "error receiving Diffie-Hellman public key" << endl;
+    close(fd);
+    return -1;
+  }
+
+  Number shared_secret;
+  try {
+    shared_secret = dh_shared_secret(
+        dh_decode_public_key(server_key_message.payload_as_string()),
+        dh_keys.private_key);
+  } catch (const std::exception &error) {
+    cerr << "Diffie-Hellman exchange failed: " << error.what() << endl;
+    close(fd);
+    return -1;
+  }
+  cout << "DH shared secret: " << shared_secret.to_hex() << endl;
 
   if (!send_message(fd, chat_protocol::login_request(username))) {
     cerr << "error sending username" << endl;

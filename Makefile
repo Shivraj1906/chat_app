@@ -9,10 +9,10 @@ SERVER_SOURCES = server.cpp client_registry.cpp $(COMMON_SOURCES)
 
 all: client server
 
-client: $(CLIENT_SOURCES) message.h socket_io.h chat_protocol.h client_command.h
+client: $(CLIENT_SOURCES) message.h socket_io.h chat_protocol.h client_command.h key_exchange.h
 	$(CXX) $(CXXFLAGS) -pthread $(CLIENT_SOURCES) -o $@
 
-server: $(SERVER_SOURCES) message.h socket_io.h chat_protocol.h client_registry.h
+server: $(SERVER_SOURCES) message.h socket_io.h chat_protocol.h client_registry.h key_exchange.h
 	$(CXX) $(CXXFLAGS) -pthread $(SERVER_SOURCES) -o $@
 
 clean:
