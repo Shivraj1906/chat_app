@@ -11,11 +11,17 @@
 #include "chat_protocol.h"
 #include "client_command.h"
 #include "key_exchange.h"
+#include "secure_channel.h"
 #include "socket_io.h"
 
 using namespace std;
 
 pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+struct ReceiveContext {
+  int fd;
+  const SessionKey *key;
+};
 
 void print_prompt() {
   pthread_mutex_lock(&output_mutex);
@@ -24,10 +30,11 @@ void print_prompt() {
 }
 
 void *receive_messages(void *argument) {
-  const int fd = *static_cast<int *>(argument);
+  const ReceiveContext &context = *static_cast<ReceiveContext *>(argument);
+  const int fd = context.fd;
   Message message(MessageType::CHAT_MESSAGE, "");
 
-  while (receive_message(fd, message)) {
+  while (receive_secure_message(fd, message, *context.key)) {
     pthread_mutex_lock(&output_mutex);
     cout << '\r';
     if (message.type() == MessageType::SERVER_ERROR) {
@@ -117,16 +124,25 @@ int main(int argc, char *argv[]) {
     close(fd);
     return -1;
   }
-  cout << "DH shared secret: " << shared_secret.to_hex() << endl;
+  SessionKey session_key{};
+  if (!derive_session_key(shared_secret, session_key)) {
+    cerr << "failed to derive AES session key" << endl;
+    close(fd);
+    return -1;
+  }
+  cout << "Secure channel established with RFC 3526 group 14, "
+          "HKDF-SHA256 and AES-256-GCM"
+       << endl;
 
-  if (!send_message(fd, chat_protocol::login_request(username))) {
+  if (!send_secure_message(fd, chat_protocol::login_request(username),
+                           session_key)) {
     cerr << "error sending username" << endl;
     close(fd);
     return -1;
   }
 
   Message login_response(MessageType::LOGIN_REJECTED, "");
-  if (!receive_message(fd, login_response)) {
+  if (!receive_secure_message(fd, login_response, session_key)) {
     cerr << "error receiving login response" << endl;
     close(fd);
     return -1;
@@ -141,7 +157,9 @@ int main(int argc, char *argv[]) {
   print_command_guide();
 
   pthread_t receiver_thread;
-  if (pthread_create(&receiver_thread, nullptr, receive_messages, &fd) != 0) {
+  ReceiveContext receive_context{fd, &session_key};
+  if (pthread_create(&receiver_thread, nullptr, receive_messages,
+                     &receive_context) != 0) {
     cerr << "error creating receiver thread" << endl;
     close(fd);
     return -1;
@@ -167,13 +185,15 @@ int main(int argc, char *argv[]) {
       selected_partner = command.recipient;
       cout << "Now chatting with " << selected_partner << endl;
     } else if (command.type == ClientCommandType::LIST_USERS) {
-      if (!send_message(fd, chat_protocol::who_request())) {
+      if (!send_secure_message(fd, chat_protocol::who_request(), session_key)) {
         break;
       }
     } else if (command.type == ClientCommandType::SEND_MESSAGE) {
       selected_partner = command.recipient;
-      if (!send_message(fd, chat_protocol::direct_message(
-                                command.recipient, command.text))) {
+      if (!send_secure_message(
+              fd,
+              chat_protocol::direct_message(command.recipient, command.text),
+              session_key)) {
         break;
       }
     }

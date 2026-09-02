@@ -13,6 +13,7 @@
 #include "chat_protocol.h"
 #include "client_registry.h"
 #include "key_exchange.h"
+#include "secure_channel.h"
 #include "socket_io.h"
 
 namespace {
@@ -64,6 +65,7 @@ void *handle_client(void *argument) {
     return nullptr;
   }
 
+  SessionKey session_key{};
   try {
     const Number client_public_key =
         dh_decode_public_key(client_key_message.payload_as_string());
@@ -76,7 +78,10 @@ void *handle_client(void *argument) {
     }
     const Number shared_secret =
         dh_shared_secret(client_public_key, dh_keys.private_key);
-    log_line("DH", "shared secret: " + shared_secret.to_hex());
+    if (!derive_session_key(shared_secret, session_key))
+      throw std::runtime_error("could not derive AES session key");
+    log_line("INFO", "secure channel established with RFC 3526 group 14, "
+                     "HKDF-SHA256 and AES-256-GCM");
   } catch (const std::exception &error) {
     log_line("WARN", std::string("Diffie-Hellman exchange failed: ") +
                          error.what());
@@ -85,7 +90,7 @@ void *handle_client(void *argument) {
   }
 
   Message hello(MessageType::CLIENT_HELLO, "");
-  if (!receive_message(client_fd, hello) ||
+  if (!receive_secure_message(client_fd, hello, session_key) ||
       hello.type() != MessageType::CLIENT_HELLO) {
     log_line("WARN", "connection closed before login");
     close(client_fd);
@@ -94,11 +99,12 @@ void *handle_client(void *argument) {
 
   const std::string username = hello.payload_as_string();
   std::string login_error;
-  if (!registry.register_client(username, client_fd,
+  if (!registry.register_client(username, client_fd, session_key,
                                 chat_protocol::login_accepted(),
                                 login_error)) {
     if (!login_error.empty()) {
-      send_message(client_fd, chat_protocol::login_rejected(login_error));
+      send_secure_message(client_fd, chat_protocol::login_rejected(login_error),
+                          session_key);
       log_line("WARN",
                "login rejected for '" + username + "': " + login_error);
     }
@@ -109,7 +115,7 @@ void *handle_client(void *argument) {
   log_line("INFO", username + " connected");
   Message incoming(MessageType::CHAT_MESSAGE, "");
 
-  while (receive_message(client_fd, incoming)) {
+  while (receive_secure_message(client_fd, incoming, session_key)) {
     switch (incoming.type()) {
     case MessageType::DIRECT_MESSAGE:
       relay_direct_message(registry, username, incoming);
@@ -133,19 +139,19 @@ void *handle_client(void *argument) {
 } // namespace
 
 int main(int argc, char *argv[]) {
-  if (argc > 2) {
-    std::cerr << "Usage: " << argv[0] << " [port]" << std::endl;
+  if (argc > 3) {
+    std::cerr << "Usage: " << argv[0] << " [port] [bind-ip]" << std::endl;
     return -1;
   }
 
-  const long requested_port = argc == 2 ? std::strtol(argv[1], nullptr, 10)
+  const long requested_port = argc >= 2 ? std::strtol(argv[1], nullptr, 10)
                                         : 5000;
   if (requested_port < 1 || requested_port > 65535) {
     std::cerr << "invalid port" << std::endl;
     return -1;
   }
   const std::uint16_t port = static_cast<std::uint16_t>(requested_port);
-  const std::string server_ip = "127.0.0.1";
+  const std::string server_ip = argc == 3 ? argv[2] : "127.0.0.1";
   const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (server_fd == -1) {
     log_line("ERROR", "could not create socket");

@@ -78,6 +78,23 @@ public:
     return output.str();
   }
 
+  std::vector<std::uint8_t> to_bytes(std::size_t width) const {
+    if (bit_length() > width * 8)
+      throw std::length_error("Number does not fit in requested byte width");
+
+    std::vector<std::uint8_t> bytes(width, 0);
+    for (std::size_t limb = 0; limb < n.size(); ++limb) {
+      for (std::size_t byte = 0; byte < 8; ++byte) {
+        const std::size_t offset = limb * 8 + byte;
+        if (offset >= width)
+          break;
+        bytes[width - 1 - offset] =
+            static_cast<std::uint8_t>(n[limb] >> (byte * 8));
+      }
+    }
+    return bytes;
+  }
+
   friend bool operator==(const Number &a, const Number &b) {
     return a.n == b.n;
   }

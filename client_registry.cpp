@@ -7,6 +7,7 @@
 #include <vector>
 
 bool ClientRegistry::register_client(const std::string &username, int fd,
+                                     const SessionKey &key,
                                      const Message &confirmation,
                                      std::string &error) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -19,8 +20,8 @@ bool ClientRegistry::register_client(const std::string &username, int fd,
     return false;
   }
 
-  clients_[username] = fd;
-  if (!send_message(fd, confirmation)) {
+  clients_.emplace(username, ClientConnection{fd, key});
+  if (!send_secure_message(fd, confirmation, key)) {
     clients_.erase(username);
     return false;
   }
@@ -30,7 +31,7 @@ bool ClientRegistry::register_client(const std::string &username, int fd,
 void ClientRegistry::remove(const std::string &username, int fd) {
   std::lock_guard<std::mutex> lock(mutex_);
   const auto client = clients_.find(username);
-  if (client != clients_.end() && client->second == fd) {
+  if (client != clients_.end() && client->second.fd == fd) {
     clients_.erase(client);
   }
 }
@@ -39,7 +40,8 @@ bool ClientRegistry::send_to(const std::string &username,
                              const Message &message) {
   std::lock_guard<std::mutex> lock(mutex_);
   const auto client = clients_.find(username);
-  return client != clients_.end() && send_message(client->second, message);
+  return client != clients_.end() &&
+         send_secure_message(client->second.fd, message, client->second.key);
 }
 
 std::string ClientRegistry::online_users() const {
