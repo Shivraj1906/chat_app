@@ -10,7 +10,7 @@ PROXY_SOURCES = mitm_proxy.cpp message.cpp socket_io.cpp secure_channel.cpp pki.
 
 all: client server mitm_proxy
 
-client: $(CLIENT_SOURCES) message.h socket_io.h chat_protocol.h client_command.h key_exchange.h
+client: $(CLIENT_SOURCES) message.h socket_io.h chat_protocol.h client_command.h key_exchange.h pki.h
 	$(CXX) $(CXXFLAGS) -pthread $(CLIENT_SOURCES) -lcrypto -o $@
 
 server: $(SERVER_SOURCES) message.h socket_io.h chat_protocol.h client_registry.h key_exchange.h pki.h

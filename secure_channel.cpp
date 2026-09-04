@@ -149,6 +149,20 @@ bool send_secure_message(int fd, const Message &message,
                                   envelope.data(), envelope.size()));
 }
 
+bool encrypt_payload(const std::vector<std::uint8_t> &plaintext,
+                     const SessionKey &key,
+                     std::vector<std::uint8_t> &envelope) {
+  return encrypt(plaintext, key, envelope);
+}
+
+bool decrypt_payload(const std::vector<std::uint8_t> &envelope,
+                     const SessionKey &key,
+                     std::vector<std::uint8_t> &plaintext) {
+  return decrypt(Message(MessageType::ENCRYPTED_MESSAGE, envelope.data(),
+                          envelope.size()),
+                 key, plaintext);
+}
+
 bool receive_secure_message(int fd, Message &message, const SessionKey &key,
                             std::size_t max_payload_size) {
   Message encrypted(MessageType::ENCRYPTED_MESSAGE, "");

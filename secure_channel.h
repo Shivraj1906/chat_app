@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 class Number;
 
@@ -19,3 +20,12 @@ bool derive_session_key(const Number &shared_secret, SessionKey &key);
 bool send_secure_message(int fd, const Message &message, const SessionKey &key);
 bool receive_secure_message(int fd, Message &message, const SessionKey &key,
                             std::size_t max_payload_size = 1024 * 1024);
+
+// AES-GCM helpers for the client-to-client inner layer. The returned envelope
+// is version || nonce || tag || ciphertext, ready for an application wrapper.
+bool encrypt_payload(const std::vector<std::uint8_t> &plaintext,
+                     const SessionKey &key,
+                     std::vector<std::uint8_t> &envelope);
+bool decrypt_payload(const std::vector<std::uint8_t> &envelope,
+                     const SessionKey &key,
+                     std::vector<std::uint8_t> &plaintext);

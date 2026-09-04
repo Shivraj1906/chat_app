@@ -4,6 +4,7 @@
 
 enum class ClientCommandType {
   SEND_MESSAGE,
+  START_E2E,
   SELECT_PARTNER,
   LIST_USERS,
   QUIT,

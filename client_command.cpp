@@ -18,6 +18,13 @@ ClientCommand parse_client_command(const std::string &input,
   if (input == "/who") {
     return command(ClientCommandType::LIST_USERS);
   }
+  if (input.compare(0, 5, "/e2e ") == 0) {
+    const std::string username = input.substr(5);
+    if (username.empty())
+      return command(ClientCommandType::INVALID, "", "",
+                     "Usage: /e2e <username>");
+    return command(ClientCommandType::START_E2E, username);
+  }
   if (input.compare(0, 6, "/chat ") == 0) {
     const std::string username = input.substr(6);
     if (username.empty()) {

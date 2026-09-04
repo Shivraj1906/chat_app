@@ -154,6 +154,20 @@ bool hex_decode(const std::string &text, std::vector<std::uint8_t> &bytes) {
   return true;
 }
 
+std::string sha256_hex(const std::vector<std::uint8_t> &bytes) {
+  unsigned char digest[EVP_MAX_MD_SIZE] = {};
+  unsigned int digest_size = 0;
+  EVP_MD_CTX *context = EVP_MD_CTX_new();
+  if (!context || EVP_DigestInit_ex(context, EVP_sha256(), nullptr) != 1 ||
+      EVP_DigestUpdate(context, bytes.data(), bytes.size()) != 1 ||
+      EVP_DigestFinal_ex(context, digest, &digest_size) != 1) {
+    EVP_MD_CTX_free(context);
+    return std::string();
+  }
+  EVP_MD_CTX_free(context);
+  return hex_encode(std::vector<std::uint8_t>(digest, digest + digest_size));
+}
+
 bool random_bytes(std::size_t size, std::vector<std::uint8_t> &bytes) {
   if (size > static_cast<std::size_t>(std::numeric_limits<int>::max()))
     return false;

@@ -6,6 +6,12 @@
 
 namespace chat_protocol {
 
+// Phase 4 client-to-client payload tags. The server routes these as opaque
+// direct-message text and does not interpret their contents.
+static const char E2E_INIT_TAG[] = "__E2E_INIT__";
+static const char E2E_ACK_TAG[] = "__E2E_ACK__";
+static const char E2E_MESSAGE_TAG[] = "__E2E_MSG__";
+
 struct DirectMessage {
   std::string recipient;
   std::string text;

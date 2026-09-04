@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <map>
+#include <mutex>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <string>
@@ -20,10 +22,132 @@ using namespace std;
 
 pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+struct E2eState {
+  std::mutex mutex;
+  std::mutex send_mutex;
+  std::map<std::string, SessionKey> sessions;
+  std::map<std::string, DhKeyPair> pending;
+};
+
 struct ReceiveContext {
   int fd;
   const SessionKey *key;
+  E2eState *e2e;
 };
+
+bool split_delivered_message(const Message &message, std::string &sender,
+                             std::string &text) {
+  if (message.type() != MessageType::CHAT_MESSAGE)
+    return false;
+  const std::string payload = message.payload_as_string();
+  const std::size_t separator = payload.find(": ");
+  if (separator == std::string::npos || separator == 0)
+    return false;
+  sender = payload.substr(0, separator);
+  text = payload.substr(separator + 2);
+  return true;
+}
+
+bool send_to_server(int fd, const Message &message, const SessionKey &key,
+                    E2eState &e2e) {
+  std::lock_guard<std::mutex> lock(e2e.send_mutex);
+  return send_secure_message(fd, message, key);
+}
+
+void print_e2e_fingerprint(const std::string &peer,
+                           const SessionKey &session) {
+  const std::vector<std::uint8_t> key_bytes(session.begin(), session.end());
+  const std::string fingerprint = sha256_hex(key_bytes);
+  pthread_mutex_lock(&output_mutex);
+  std::cout << "E2E session with " << peer << " established; key fingerprint: "
+            << fingerprint << std::endl;
+  std::cout << "> " << std::flush;
+  pthread_mutex_unlock(&output_mutex);
+}
+
+bool handle_e2e_message(const Message &message, const SessionKey &server_key,
+                        ReceiveContext &context) {
+  std::string sender;
+  std::string text;
+  if (!split_delivered_message(message, sender, text))
+    return false;
+
+  const std::string init_tag = chat_protocol::E2E_INIT_TAG;
+  const std::string ack_tag = chat_protocol::E2E_ACK_TAG;
+  const std::string message_tag = chat_protocol::E2E_MESSAGE_TAG;
+  if (text.compare(0, init_tag.size(), init_tag) == 0) {
+    try {
+      const DhKeyPair keys = dh_generate_key_pair();
+      const Number peer_public =
+          dh_decode_public_key(text.substr(init_tag.size()));
+      const Number shared = dh_shared_secret(peer_public, keys.private_key);
+      SessionKey session{};
+      if (!derive_session_key(shared, session))
+        return false;
+      {
+        std::lock_guard<std::mutex> lock(context.e2e->mutex);
+        context.e2e->sessions[sender] = session;
+      }
+      print_e2e_fingerprint(sender, session);
+      return send_to_server(
+          context.fd,
+          chat_protocol::direct_message(
+              sender, ack_tag + dh_encode_public_key(keys.public_key)),
+          server_key, *context.e2e);
+    } catch (const std::exception &) {
+      return false;
+    }
+  }
+
+  if (text.compare(0, ack_tag.size(), ack_tag) == 0) {
+    DhKeyPair keys;
+    {
+      std::lock_guard<std::mutex> lock(context.e2e->mutex);
+      const auto pending = context.e2e->pending.find(sender);
+      if (pending == context.e2e->pending.end())
+        return false;
+      keys = pending->second;
+      context.e2e->pending.erase(pending);
+    }
+    try {
+      const Number peer_public =
+          dh_decode_public_key(text.substr(ack_tag.size()));
+      const Number shared = dh_shared_secret(peer_public, keys.private_key);
+      SessionKey session{};
+      if (!derive_session_key(shared, session))
+        return false;
+      std::lock_guard<std::mutex> lock(context.e2e->mutex);
+      context.e2e->sessions[sender] = session;
+      print_e2e_fingerprint(sender, session);
+      return true;
+    } catch (const std::exception &) {
+      return false;
+    }
+  }
+
+  if (text.compare(0, message_tag.size(), message_tag) == 0) {
+    SessionKey session{};
+    {
+      std::lock_guard<std::mutex> lock(context.e2e->mutex);
+      const auto found = context.e2e->sessions.find(sender);
+      if (found == context.e2e->sessions.end())
+        return false;
+      session = found->second;
+    }
+    std::vector<std::uint8_t> envelope;
+    std::vector<std::uint8_t> plaintext;
+    if (!hex_decode(text.substr(message_tag.size()), envelope) ||
+        !decrypt_payload(envelope, session, plaintext))
+      return false;
+    pthread_mutex_lock(&output_mutex);
+    std::cout << '\r' << sender << ": "
+              << std::string(plaintext.begin(), plaintext.end()) << std::endl;
+    std::cout << "> " << std::flush;
+    pthread_mutex_unlock(&output_mutex);
+    return true;
+  }
+  return false;
+}
 
 void print_prompt() {
   pthread_mutex_lock(&output_mutex);
@@ -32,11 +156,14 @@ void print_prompt() {
 }
 
 void *receive_messages(void *argument) {
-  const ReceiveContext &context = *static_cast<ReceiveContext *>(argument);
+  ReceiveContext &context = *static_cast<ReceiveContext *>(argument);
   const int fd = context.fd;
   Message message(MessageType::CHAT_MESSAGE, "");
 
   while (receive_secure_message(fd, message, *context.key)) {
+    if (message.type() == MessageType::CHAT_MESSAGE &&
+        handle_e2e_message(message, *context.key, context))
+      continue;
     pthread_mutex_lock(&output_mutex);
     cout << '\r';
     if (message.type() == MessageType::SERVER_ERROR) {
@@ -57,6 +184,7 @@ void print_command_guide() {
   cout << "\nCommands:\n"
        << "  @<username> <message>  Send a message and select that user\n"
        << "  /chat <username>       Select a chat partner\n"
+       << "  /e2e <username>        Establish end-to-end encryption\n"
        << "  /who                   List online users\n"
        << "  /quit                  Disconnect and exit\n"
        << endl;
@@ -197,8 +325,9 @@ int main(int argc, char *argv[]) {
   cout << "Connected as " << username << endl;
   print_command_guide();
 
+  E2eState e2e;
   pthread_t receiver_thread;
-  ReceiveContext receive_context{fd, &session_key};
+  ReceiveContext receive_context{fd, &session_key, &e2e};
   if (pthread_create(&receiver_thread, nullptr, receive_messages,
                      &receive_context) != 0) {
     cerr << "error creating receiver thread" << endl;
@@ -226,15 +355,50 @@ int main(int argc, char *argv[]) {
       selected_partner = command.recipient;
       cout << "Now chatting with " << selected_partner << endl;
     } else if (command.type == ClientCommandType::LIST_USERS) {
-      if (!send_secure_message(fd, chat_protocol::who_request(), session_key)) {
+      if (!send_to_server(fd, chat_protocol::who_request(), session_key, e2e)) {
         break;
       }
+    } else if (command.type == ClientCommandType::START_E2E) {
+      const DhKeyPair keys = dh_generate_key_pair();
+      {
+        std::lock_guard<std::mutex> lock(e2e.mutex);
+        e2e.pending[command.recipient] = keys;
+      }
+      selected_partner = command.recipient;
+      if (!send_to_server(
+              fd,
+              chat_protocol::direct_message(
+                  command.recipient,
+                  chat_protocol::E2E_INIT_TAG +
+                      dh_encode_public_key(keys.public_key)),
+              session_key, e2e)) {
+        break;
+      }
+      cout << "Started end-to-end key exchange with " << command.recipient
+           << endl;
     } else if (command.type == ClientCommandType::SEND_MESSAGE) {
       selected_partner = command.recipient;
-      if (!send_secure_message(
-              fd,
-              chat_protocol::direct_message(command.recipient, command.text),
-              session_key)) {
+      SessionKey e2e_key{};
+      bool use_e2e = false;
+      {
+        std::lock_guard<std::mutex> lock(e2e.mutex);
+        const auto found = e2e.sessions.find(command.recipient);
+        if (found != e2e.sessions.end()) {
+          e2e_key = found->second;
+          use_e2e = true;
+        }
+      }
+      string text = command.text;
+      if (use_e2e) {
+        const vector<uint8_t> plaintext(text.begin(), text.end());
+        vector<uint8_t> envelope;
+        if (!encrypt_payload(plaintext, e2e_key, envelope))
+          break;
+        text = chat_protocol::E2E_MESSAGE_TAG + hex_encode(envelope);
+      }
+      if (!send_to_server(fd, chat_protocol::direct_message(command.recipient,
+                                                              text),
+                          session_key, e2e)) {
         break;
       }
     }

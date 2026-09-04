@@ -51,7 +51,8 @@ void relay_direct_message(ClientRegistry &registry,
     return;
   }
 
-  log_line("CHAT", source_username + " -> " + direct.recipient);
+  log_line("CHAT", source_username + " -> " + direct.recipient +
+                       " payload=" + direct.text);
 }
 
 void *handle_client(void *argument) {

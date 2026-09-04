@@ -19,4 +19,5 @@ bool verify_handshake_signature(
 
 std::string hex_encode(const std::vector<std::uint8_t> &bytes);
 bool hex_decode(const std::string &text, std::vector<std::uint8_t> &bytes);
+std::string sha256_hex(const std::vector<std::uint8_t> &bytes);
 bool random_bytes(std::size_t size, std::vector<std::uint8_t> &bytes);
