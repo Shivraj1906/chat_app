@@ -1,3 +1,7 @@
 client
 server
 mitm_proxy
+pki/*.key
+pki/*.csr
+pki/*.srl
+pki/*.crt

@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -11,6 +12,7 @@
 #include "chat_protocol.h"
 #include "client_command.h"
 #include "key_exchange.h"
+#include "pki.h"
 #include "secure_channel.h"
 #include "socket_io.h"
 
@@ -61,8 +63,9 @@ void print_command_guide() {
 }
 
 int main(int argc, char *argv[]) {
-  if (argc != 4) {
-    cerr << "Usage: " << argv[0] << " <server-ip> <port> <username>" << endl;
+  if (argc != 4 && argc != 5) {
+    cerr << "Usage: " << argv[0]
+         << " <server-ip> <port> <username> [ca-certificate]" << endl;
     return -1;
   }
 
@@ -97,27 +100,64 @@ int main(int argc, char *argv[]) {
     return -1;
   }
 
-  const DhKeyPair dh_keys = dh_generate_key_pair();
-  if (!send_message(fd,
-                    Message(MessageType::DH_PUBLIC_KEY,
-                            dh_encode_public_key(dh_keys.public_key)))) {
-    cerr << "error sending Diffie-Hellman public key" << endl;
+  const string ca_certificate_path = argc == 5 ? argv[4] : "pki/ca.crt";
+  Message certificate_message(MessageType::SERVER_CERTIFICATE, "");
+  if (!receive_message(fd, certificate_message) ||
+      certificate_message.type() != MessageType::SERVER_CERTIFICATE ||
+      !verify_server_certificate(
+          std::vector<std::uint8_t>(certificate_message.payload_data(),
+                                    certificate_message.payload_data() +
+                                        certificate_message.payload_size()),
+          ca_certificate_path, server_ip)) {
+    cerr << "server certificate validation failed" << endl;
     close(fd);
     return -1;
   }
 
-  Message server_key_message(MessageType::DH_PUBLIC_KEY, "");
+  const DhKeyPair dh_keys = dh_generate_key_pair();
+  vector<uint8_t> challenge;
+  if (!random_bytes(32, challenge)) {
+    cerr << "error generating handshake challenge" << endl;
+    close(fd);
+    return -1;
+  }
+  const string client_key_payload =
+      hex_encode(challenge) + "\n" + dh_encode_public_key(dh_keys.public_key);
+  if (!send_message(fd,
+                    Message(MessageType::CLIENT_KEY_EXCHANGE,
+                            client_key_payload))) {
+    cerr << "error sending authenticated DH exchange" << endl;
+    close(fd);
+    return -1;
+  }
+
+  Message server_key_message(MessageType::SERVER_KEY_EXCHANGE, "");
   if (!receive_message(fd, server_key_message) ||
-      server_key_message.type() != MessageType::DH_PUBLIC_KEY) {
-    cerr << "error receiving Diffie-Hellman public key" << endl;
+      server_key_message.type() != MessageType::SERVER_KEY_EXCHANGE) {
+    cerr << "error receiving authenticated DH exchange" << endl;
     close(fd);
     return -1;
   }
 
   Number shared_secret;
   try {
+    const string response = server_key_message.payload_as_string();
+    const size_t separator = response.rfind('\n');
+    if (separator == string::npos)
+      throw invalid_argument("invalid server handshake payload");
+    const string server_key_payload = response.substr(0, separator);
+    vector<uint8_t> signature;
+    if (!hex_decode(response.substr(separator + 1), signature))
+      throw invalid_argument("invalid server handshake signature");
+    const string signed_text = client_key_payload + "\n" + server_key_payload;
+    const vector<uint8_t> signed_bytes(signed_text.begin(), signed_text.end());
+    const vector<uint8_t> certificate(
+        certificate_message.payload_data(),
+        certificate_message.payload_data() + certificate_message.payload_size());
+    if (!verify_handshake_signature(certificate, signed_bytes, signature))
+      throw invalid_argument("server proof-of-possession failed");
     shared_secret = dh_shared_secret(
-        dh_decode_public_key(server_key_message.payload_as_string()),
+        dh_decode_public_key(server_key_payload),
         dh_keys.private_key);
   } catch (const std::exception &error) {
     cerr << "Diffie-Hellman exchange failed: " << error.what() << endl;
@@ -130,8 +170,9 @@ int main(int argc, char *argv[]) {
     close(fd);
     return -1;
   }
-  cout << "Secure channel established with RFC 3526 group 14, "
-          "HKDF-SHA256 and AES-256-GCM"
+  cout << "Server certificate validated; proof-of-possession verified; "
+          "secure channel established with RFC 3526 group 14, HKDF-SHA256 "
+          "and AES-256-GCM"
        << endl;
 
   if (!send_secure_message(fd, chat_protocol::login_request(username),

@@ -13,6 +13,7 @@
 #include "chat_protocol.h"
 #include "client_registry.h"
 #include "key_exchange.h"
+#include "pki.h"
 #include "secure_channel.h"
 #include "socket_io.h"
 
@@ -21,6 +22,8 @@ namespace {
 struct ClientContext {
   int fd;
   ClientRegistry *registry;
+  const std::vector<std::uint8_t> *certificate;
+  const std::string *private_key_path;
 };
 
 void log_line(const std::string &level, const std::string &text) {
@@ -57,9 +60,17 @@ void *handle_client(void *argument) {
   const int client_fd = context->fd;
   ClientRegistry &registry = *context->registry;
 
-  Message client_key_message(MessageType::DH_PUBLIC_KEY, "");
+  if (!send_message(client_fd,
+                    Message(MessageType::SERVER_CERTIFICATE,
+                            context->certificate->data(),
+                            context->certificate->size()))) {
+    close(client_fd);
+    return nullptr;
+  }
+
+  Message client_key_message(MessageType::CLIENT_KEY_EXCHANGE, "");
   if (!receive_message(client_fd, client_key_message) ||
-      client_key_message.type() != MessageType::DH_PUBLIC_KEY) {
+      client_key_message.type() != MessageType::CLIENT_KEY_EXCHANGE) {
     log_line("WARN", "connection closed before Diffie-Hellman exchange");
     close(client_fd);
     return nullptr;
@@ -67,12 +78,29 @@ void *handle_client(void *argument) {
 
   SessionKey session_key{};
   try {
+    const std::string client_payload = client_key_message.payload_as_string();
+    const std::size_t separator = client_payload.find('\n');
+    if (separator != 64)
+      throw std::invalid_argument("invalid client handshake payload");
+    std::vector<std::uint8_t> challenge;
+    if (!hex_decode(client_payload.substr(0, separator), challenge) ||
+        challenge.size() != 32)
+      throw std::invalid_argument("invalid client challenge");
     const Number client_public_key =
-        dh_decode_public_key(client_key_message.payload_as_string());
+        dh_decode_public_key(client_payload.substr(separator + 1));
     const DhKeyPair dh_keys = dh_generate_key_pair();
+    const std::string server_payload =
+        dh_encode_public_key(dh_keys.public_key);
+    const std::string signed_text = client_payload + "\n" + server_payload;
+    std::vector<std::uint8_t> signature;
+    if (!sign_handshake_value(*context->private_key_path,
+                              std::vector<std::uint8_t>(
+                                  signed_text.begin(), signed_text.end()),
+                              signature))
+      throw std::runtime_error("could not sign DH transcript");
+    const std::string response = server_payload + "\n" + hex_encode(signature);
     if (!send_message(client_fd,
-                      Message(MessageType::DH_PUBLIC_KEY,
-                              dh_encode_public_key(dh_keys.public_key)))) {
+                      Message(MessageType::SERVER_KEY_EXCHANGE, response))) {
       close(client_fd);
       return nullptr;
     }
@@ -139,8 +167,10 @@ void *handle_client(void *argument) {
 } // namespace
 
 int main(int argc, char *argv[]) {
-  if (argc > 3) {
-    std::cerr << "Usage: " << argv[0] << " [port] [bind-ip]" << std::endl;
+  if (argc > 5) {
+    std::cerr << "Usage: " << argv[0]
+              << " [port] [bind-ip] [certificate] [private-key]"
+              << std::endl;
     return -1;
   }
 
@@ -151,7 +181,15 @@ int main(int argc, char *argv[]) {
     return -1;
   }
   const std::uint16_t port = static_cast<std::uint16_t>(requested_port);
-  const std::string server_ip = argc == 3 ? argv[2] : "127.0.0.1";
+  const std::string server_ip = argc >= 3 ? argv[2] : "127.0.0.1";
+  std::vector<std::uint8_t> certificate;
+  const std::string certificate_path = argc >= 4 ? argv[3] : "pki/server.crt";
+  const std::string private_key_path = argc >= 5 ? argv[4] : "pki/server.key";
+  if (!read_binary_file(certificate_path, certificate)) {
+    log_line("ERROR", "could not read server certificate: " + certificate_path);
+    return -1;
+  }
+
   const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (server_fd == -1) {
     log_line("ERROR", "could not create socket");
@@ -186,7 +224,9 @@ int main(int argc, char *argv[]) {
     }
 
     pthread_t thread;
-    ClientContext *context = new ClientContext{client_fd, &registry};
+    ClientContext *context =
+        new ClientContext{client_fd, &registry, &certificate,
+                          &private_key_path};
     if (pthread_create(&thread, nullptr, handle_client, context) != 0) {
       delete context;
       close(client_fd);

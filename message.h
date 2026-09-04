@@ -18,6 +18,9 @@ enum class MessageType : std::uint8_t {
   SERVER_ERROR = 8,
   DH_PUBLIC_KEY = 9,
   ENCRYPTED_MESSAGE = 10,
+  SERVER_CERTIFICATE = 11,
+  CLIENT_KEY_EXCHANGE = 12,
+  SERVER_KEY_EXCHANGE = 13,
   // Add new message types above COUNT. Header validation updates automatically.
   COUNT
 };
