@@ -1,7 +1,9 @@
 #include <arpa/inet.h>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <condition_variable>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -26,13 +28,25 @@ struct E2eState {
   std::mutex mutex;
   std::mutex send_mutex;
   std::map<std::string, SessionKey> sessions;
-  std::map<std::string, DhKeyPair> pending;
+  struct PendingExchange {
+    DhKeyPair keys;
+    std::string token;
+  };
+  struct PendingSession {
+    SessionKey key;
+    std::string token;
+  };
+  std::map<std::string, PendingExchange> pending;
+  std::map<std::string, PendingSession> incoming;
+  bool stop_timer = false;
+  std::condition_variable timer_condition;
 };
 
 struct ReceiveContext {
   int fd;
   const SessionKey *key;
   E2eState *e2e;
+  std::string username;
 };
 
 bool split_delivered_message(const Message &message, std::string &sender,
@@ -59,10 +73,34 @@ void print_e2e_fingerprint(const std::string &peer,
   const std::vector<std::uint8_t> key_bytes(session.begin(), session.end());
   const std::string fingerprint = sha256_hex(key_bytes);
   pthread_mutex_lock(&output_mutex);
-  std::cout << "E2E session with " << peer << " established; key fingerprint: "
-            << fingerprint << std::endl;
+  const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  std::cout << "E2E session with " << peer << " established; timestamp=" << now
+            << "; key fingerprint: " << fingerprint << std::endl;
   std::cout << "> " << std::flush;
   pthread_mutex_unlock(&output_mutex);
+}
+
+bool start_e2e_exchange(int fd, const SessionKey &server_key, E2eState &e2e,
+                        const std::string &peer) {
+  const DhKeyPair keys = dh_generate_key_pair();
+  std::vector<std::uint8_t> token_bytes;
+  if (!random_bytes(16, token_bytes))
+    return false;
+  const std::string token = hex_encode(token_bytes);
+  {
+    std::lock_guard<std::mutex> lock(e2e.mutex);
+    e2e.pending[peer] = E2eState::PendingExchange{keys, token};
+  }
+  const std::string payload =
+      chat_protocol::E2E_INIT_TAG + token + "\n" +
+      dh_encode_public_key(keys.public_key);
+  if (send_to_server(fd, chat_protocol::direct_message(peer, payload),
+                     server_key, e2e))
+    return true;
+  std::lock_guard<std::mutex> lock(e2e.mutex);
+  e2e.pending.erase(peer);
+  return false;
 }
 
 bool handle_e2e_message(const Message &message, const SessionKey &server_key,
@@ -77,47 +115,102 @@ bool handle_e2e_message(const Message &message, const SessionKey &server_key,
   const std::string message_tag = chat_protocol::E2E_MESSAGE_TAG;
   if (text.compare(0, init_tag.size(), init_tag) == 0) {
     try {
+      const std::string init = text.substr(init_tag.size());
+      const std::size_t separator = init.find('\n');
+      if (separator != 32 ||
+          context.username < sender) {
+        std::lock_guard<std::mutex> lock(context.e2e->mutex);
+        if (context.username < sender &&
+            context.e2e->sessions.find(sender) !=
+                context.e2e->sessions.end())
+          return true;
+        if (separator != 32)
+          return false;
+      }
+      const std::string token = init.substr(0, separator);
       const DhKeyPair keys = dh_generate_key_pair();
       const Number peer_public =
-          dh_decode_public_key(text.substr(init_tag.size()));
+          dh_decode_public_key(init.substr(separator + 1));
       const Number shared = dh_shared_secret(peer_public, keys.private_key);
       SessionKey session{};
       if (!derive_session_key(shared, session))
         return false;
       {
         std::lock_guard<std::mutex> lock(context.e2e->mutex);
-        context.e2e->sessions[sender] = session;
+        context.e2e->incoming[sender] =
+            E2eState::PendingSession{session, token};
       }
-      print_e2e_fingerprint(sender, session);
-      return send_to_server(
+      const bool sent = send_to_server(
           context.fd,
           chat_protocol::direct_message(
-              sender, ack_tag + dh_encode_public_key(keys.public_key)),
+              sender, ack_tag + token + "\n" +
+                          dh_encode_public_key(keys.public_key)),
           server_key, *context.e2e);
+      if (sent)
+        return true;
+      std::lock_guard<std::mutex> lock(context.e2e->mutex);
+      context.e2e->incoming.erase(sender);
+      return false;
     } catch (const std::exception &) {
       return false;
     }
   }
 
   if (text.compare(0, ack_tag.size(), ack_tag) == 0) {
-    DhKeyPair keys;
+    const std::string ack = text.substr(ack_tag.size());
+    const std::size_t separator = ack.find('\n');
+    if (separator != 32)
+      return false;
+    const std::string token = ack.substr(0, separator);
+    const std::string data = ack.substr(separator + 1);
+
+    // The initiator confirms receipt of the responder's public key with the
+    // same ACK tag. This lets the responder switch keys before new messages
+    // arrive, without a simultaneous-rotation race.
+    if (data == "CONFIRM") {
+      SessionKey session{};
+      {
+        std::lock_guard<std::mutex> lock(context.e2e->mutex);
+        const auto incoming = context.e2e->incoming.find(sender);
+        if (incoming == context.e2e->incoming.end() ||
+            incoming->second.token != token)
+          return false;
+        session = incoming->second.key;
+        context.e2e->incoming.erase(incoming);
+        context.e2e->sessions[sender] = session;
+      }
+      print_e2e_fingerprint(sender, session);
+      return true;
+    }
+
+    E2eState::PendingExchange pending_exchange;
     {
       std::lock_guard<std::mutex> lock(context.e2e->mutex);
       const auto pending = context.e2e->pending.find(sender);
-      if (pending == context.e2e->pending.end())
+      if (pending == context.e2e->pending.end() ||
+          pending->second.token != token)
         return false;
-      keys = pending->second;
-      context.e2e->pending.erase(pending);
+      pending_exchange = pending->second;
     }
     try {
       const Number peer_public =
-          dh_decode_public_key(text.substr(ack_tag.size()));
-      const Number shared = dh_shared_secret(peer_public, keys.private_key);
+          dh_decode_public_key(data);
+      const Number shared =
+          dh_shared_secret(peer_public, pending_exchange.keys.private_key);
       SessionKey session{};
       if (!derive_session_key(shared, session))
         return false;
-      std::lock_guard<std::mutex> lock(context.e2e->mutex);
-      context.e2e->sessions[sender] = session;
+      if (!send_to_server(
+              context.fd,
+              chat_protocol::direct_message(
+                  sender, ack_tag + token + "\nCONFIRM"),
+              server_key, *context.e2e))
+        return false;
+      {
+        std::lock_guard<std::mutex> lock(context.e2e->mutex);
+        context.e2e->pending.erase(sender);
+        context.e2e->sessions[sender] = session;
+      }
       print_e2e_fingerprint(sender, session);
       return true;
     } catch (const std::exception &) {
@@ -147,6 +240,42 @@ bool handle_e2e_message(const Message &message, const SessionKey &server_key,
     return true;
   }
   return false;
+}
+
+struct RotationContext {
+  int fd;
+  const SessionKey *server_key;
+  E2eState *e2e;
+  std::string username;
+};
+
+void *rotation_timer(void *argument) {
+  RotationContext &context = *static_cast<RotationContext *>(argument);
+  unsigned interval = 60;
+  if (const char *configured = std::getenv("CHAT_E2E_ROTATION_SECONDS")) {
+    const long value = std::strtol(configured, nullptr, 10);
+    if (value > 0)
+      interval = static_cast<unsigned>(value);
+  }
+
+  while (true) {
+    std::vector<std::string> peers;
+    {
+      std::unique_lock<std::mutex> lock(context.e2e->mutex);
+      if (context.e2e->timer_condition.wait_for(
+              lock, std::chrono::seconds(interval),
+              [&context] { return context.e2e->stop_timer; }))
+        return nullptr;
+      // A deterministic initiator avoids simultaneous rotations: only the
+      // lexicographically smaller username starts automatic renegotiation.
+      for (const auto &session : context.e2e->sessions) {
+        if (context.username < session.first)
+          peers.push_back(session.first);
+      }
+    }
+    for (const std::string &peer : peers)
+      start_e2e_exchange(context.fd, *context.server_key, *context.e2e, peer);
+  }
 }
 
 void print_prompt() {
@@ -327,10 +456,20 @@ int main(int argc, char *argv[]) {
 
   E2eState e2e;
   pthread_t receiver_thread;
-  ReceiveContext receive_context{fd, &session_key, &e2e};
+  ReceiveContext receive_context{fd, &session_key, &e2e, username};
   if (pthread_create(&receiver_thread, nullptr, receive_messages,
                      &receive_context) != 0) {
     cerr << "error creating receiver thread" << endl;
+    close(fd);
+    return -1;
+  }
+  pthread_t rotation_thread;
+  RotationContext rotation_context{fd, &session_key, &e2e, username};
+  if (pthread_create(&rotation_thread, nullptr, rotation_timer,
+                     &rotation_context) != 0) {
+    cerr << "error creating key rotation thread" << endl;
+    shutdown(fd, SHUT_RDWR);
+    pthread_join(receiver_thread, nullptr);
     close(fd);
     return -1;
   }
@@ -359,19 +498,8 @@ int main(int argc, char *argv[]) {
         break;
       }
     } else if (command.type == ClientCommandType::START_E2E) {
-      const DhKeyPair keys = dh_generate_key_pair();
-      {
-        std::lock_guard<std::mutex> lock(e2e.mutex);
-        e2e.pending[command.recipient] = keys;
-      }
       selected_partner = command.recipient;
-      if (!send_to_server(
-              fd,
-              chat_protocol::direct_message(
-                  command.recipient,
-                  chat_protocol::E2E_INIT_TAG +
-                      dh_encode_public_key(keys.public_key)),
-              session_key, e2e)) {
+      if (!start_e2e_exchange(fd, session_key, e2e, command.recipient)) {
         break;
       }
       cout << "Started end-to-end key exchange with " << command.recipient
@@ -404,8 +532,14 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  {
+    std::lock_guard<std::mutex> lock(e2e.mutex);
+    e2e.stop_timer = true;
+  }
+  e2e.timer_condition.notify_one();
   shutdown(fd, SHUT_WR);
   pthread_join(receiver_thread, nullptr);
+  pthread_join(rotation_thread, nullptr);
   close(fd);
   return 0;
 }
